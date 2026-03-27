@@ -1,0 +1,8 @@
+AVAILABLE_LANGUAGES = ["en", "de", "uk", "fr", "es", "pl", "it"]
+
+UV_MODERATE = 3
+UV_HIGH = 6
+UV_VERY_HIGH = 8
+UV_EXTREME = 11
+
+DEFAULT_NOTIFY_HOUR = 10
