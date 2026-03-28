@@ -6,16 +6,15 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 from constants import UV_VERY_HIGH, UV_HIGH, UV_EXTREME, UV_MODERATE, AVAILABLE_LANGUAGES, DEFAULT_NOTIFY_HOUR
 from translations import TRANSLATIONS
 
 load_dotenv()
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
