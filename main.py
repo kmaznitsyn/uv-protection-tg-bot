@@ -29,7 +29,6 @@ _uv_cache: dict[tuple[float, float], tuple[datetime, list[dict]]] = {}
 CACHE_TTL_SECONDS = 7200  # 2 hours
 
 
-
 # ISO 3166-1 alpha-2 country code → language
 COUNTRY_TO_LANG: dict[str, str] = {
     # German
@@ -117,11 +116,10 @@ async def geocode_city(query: str) -> tuple[float, float, str] | None:
 async def get_uv_forecast(lat: float, lon: float) -> list[dict]:
     """Fetch today's hourly UV index from Open-Meteo, cached for 2 hours."""
     key = (round(lat, 2), round(lon, 2))
-    cached_at, cached_data = _uv_cache.get(key, (None, None))
-
-    if cached_at and (datetime.now() - cached_at).total_seconds() < CACHE_TTL_SECONDS:
+    cache_entry = _uv_cache.get(key)
+    if cache_entry and (datetime.now() - cache_entry[0]).total_seconds() < CACHE_TTL_SECONDS:
         logger.debug("UV cache hit for %s", key)
-        return cached_data
+        return cache_entry[1]
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
@@ -252,8 +250,9 @@ def build_language_keyboard() -> InlineKeyboardMarkup:
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
-async def send_welcome_prompt(update: Update, lang: str):
+async def send_welcome_prompt(update: Update, lang: str) -> None:
     """Send the welcome message with location-share button."""
+    assert update.message is not None
     keyboard = [[KeyboardButton(t(lang, "share_location_btn"), request_location=True)]]
     await update.message.reply_text(
         t(lang, "welcome"),
@@ -270,8 +269,9 @@ async def ensure_location(update: Update, users: dict, user_id: str) -> bool:
     return False
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     users = load_users()
+    assert update.effective_user is not None
     lang = user_lang(users, str(update.effective_user.id))
     await send_welcome_prompt(update, lang)
 
@@ -282,8 +282,9 @@ async def _save_location(
     lat: float,
     lon: float,
     context: ContextTypes.DEFAULT_TYPE,
-) -> tuple[str, bool]:
-    """Persist location, detect language. Returns (lang, is_new_user)."""
+) -> tuple[str, bool, str | None]:
+    """Persist location, detect language. Returns (lang, is_new, country_code)."""
+    assert context.user_data is not None
     context.user_data.pop("awaiting_location", None)
 
     country_code = await get_country_code(lat, lon)
@@ -306,11 +307,14 @@ async def _save_location(
     return lang, is_new, country_code
 
 
-async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.effective_user is not None
+    assert update.message is not None
+    assert update.message.location is not None
     user = update.effective_user
     loc = update.message.location
     lang, is_new, country_code = await _save_location(
-        str(user.id), user.first_name, loc.latitude, loc.longitude, context
+        str(user.id), user.first_name or "", loc.latitude, loc.longitude, context
     )
     key = "location_saved" if is_new else "location_updated"
     display = f"{loc.latitude:.4f}, {loc.longitude:.4f}"
@@ -323,7 +327,9 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(lang, "lang_detected"), parse_mode="Markdown")
 
 
-async def cmd_uv(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_uv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.effective_user is not None
+    assert update.message is not None
     user_id = str(update.effective_user.id)
     users = load_users()
     lang = user_lang(users, user_id)
@@ -341,7 +347,9 @@ async def cmd_uv(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(t(lang, "error"))
 
 
-async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.effective_user is not None
+    assert update.message is not None
     user_id = str(update.effective_user.id)
     users = load_users()
     lang = user_lang(users, user_id)
@@ -360,7 +368,9 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(t(lang, "time_set", hour=hour), parse_mode="Markdown")
 
 
-async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.effective_user is not None
+    assert update.message is not None
     user_id = str(update.effective_user.id)
     users = load_users()
     lang = user_lang(users, user_id)
@@ -384,8 +394,10 @@ async def handle_manual_location(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
     lang: str,
-):
+) -> None:
     """Handle free-text location input: coordinates or city name."""
+    assert update.effective_user is not None
+    assert update.message is not None
     coords = parse_coordinates(text)
     if coords:
         lat, lon = coords
@@ -400,7 +412,7 @@ async def handle_manual_location(
         display = ", ".join(display.split(", ")[:2])
 
     user = update.effective_user
-    lang, _, _ = await _save_location(str(user.id), user.first_name, lat, lon, context)
+    lang, _, _ = await _save_location(str(user.id), user.first_name or "", lat, lon, context)
     await update.message.reply_text(
         t(lang, "location_updated", location=display),
         parse_mode="Markdown",
@@ -408,7 +420,11 @@ async def handle_manual_location(
     )
 
 
-async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.message is not None
+    assert update.message.text is not None
+    assert update.effective_user is not None
+    assert context.user_data is not None
     text = update.message.text
     user_id = str(update.effective_user.id)
     users = load_users()
@@ -445,10 +461,14 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
 
 
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    assert update.callback_query is not None
+    assert update.effective_user is not None
+    assert update.effective_chat is not None
     query = update.callback_query
     await query.answer()
 
+    assert query.data is not None
     user_id = str(update.effective_user.id)
     users = load_users()
     lang = user_lang(users, user_id)
@@ -470,7 +490,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_users(users)
         await query.edit_message_text(t(new_lang, "lang_set"))
         await context.bot.send_message(
-            chat_id=query.message.chat_id,
+            chat_id=update.effective_chat.id,
             text="✅",
             reply_markup=build_main_keyboard(new_lang),
         )
@@ -478,7 +498,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Daily scheduler ───────────────────────────────────────────────────────────
 
-async def send_daily_notifications(application: Application):
+async def send_daily_notifications(application: Application) -> None:
     current_hour = datetime.now().hour
     users = load_users()
 
@@ -500,7 +520,7 @@ async def send_daily_notifications(application: Application):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def main():
+def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
