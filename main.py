@@ -198,21 +198,20 @@ def build_uv_message(hourly_uv: list[dict], lang: str) -> str:
 
 
 def build_uv_day_message(hourly_uv: list[dict], lang: str) -> str:
-    """Full day forecast — used by the daily scheduled notification."""
+    """Daily scheduled notification — yes/no sunscreen needed today + peak time."""
     uv_map = _uv_by_hour(hourly_uv)
+    all_hours = [(h, uv_map[h]) for h in sorted(uv_map)]
 
-    protection_hours = [
-        (h, uv_map[h])
-        for h in sorted(uv_map)
-        if uv_map[h] >= UV_MODERATE
-    ]
-
-    if not protection_hours:
+    if not all_hours or max(uv for _, uv in all_hours) < UV_MODERATE:
         return t(lang, "uv_clear_header") + "\n\n" + t(lang, "uv_day_clear_body")
 
-    lines = [t(lang, "uv_day_header") + "\n", t(lang, "uv_day_apply")]
-    lines += _uv_lines_and_peak(protection_hours, lang, mark_protection=False)
-    return "\n".join(lines)
+    peak_hour, peak_uv = max(all_hours, key=lambda x: x[1])
+    return "\n".join([
+        t(lang, "uv_day_header") + "\n",
+        t(lang, "uv_day_needed"),
+        t(lang, "uv_peak", hour=peak_hour, uv=peak_uv),
+        t(lang, "uv_tips"),
+    ])
 
 
 def user_lang(users: dict, user_id: str) -> str:
