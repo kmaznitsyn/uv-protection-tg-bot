@@ -154,38 +154,64 @@ def uv_level_label(uv: float, lang: str) -> str:
     return t(lang, "uv_level_moderate")
 
 
-def build_uv_message(hourly_uv: list[dict], lang: str) -> str:
-    now = datetime.now()
-    current_hour = now.hour
-    today = now.date().isoformat()
-
-    uv_by_hour = {
+def _uv_by_hour(hourly_uv: list[dict]) -> dict[int, float]:
+    today = datetime.now().date().isoformat()
+    return {
         int(e["time"][11:13]): e["uv"]
         for e in hourly_uv
         if e["time"].startswith(today)
     }
 
-    # Next 3 hours starting from the current hour
+
+def _uv_lines_and_peak(
+    forecast: list[tuple[int, float]], lang: str, mark_protection: bool = False
+) -> list[str]:
+    lines = []
+    for hour, uv in forecast:
+        line = t(lang, "uv_hour_line", hour=hour, uv=uv, level=uv_level_label(uv, lang))
+        if mark_protection and uv >= UV_MODERATE:
+            line += " ⚠️"
+        lines.append(line)
+    peak_hour, peak_uv = max(forecast, key=lambda x: x[1])
+    lines.append(t(lang, "uv_peak", hour=peak_hour, uv=peak_uv))
+    lines.append(t(lang, "uv_tips"))
+    return lines
+
+
+def build_uv_message(hourly_uv: list[dict], lang: str) -> str:
+    """Next 3 hours — used by the ☀️ UV button."""
+    current_hour = datetime.now().hour
+    uv_map = _uv_by_hour(hourly_uv)
+
     forecast = [
-        (h, uv_by_hour[h])
+        (h, uv_map[h])
         for h in range(current_hour, min(current_hour + 3, 24))
-        if h in uv_by_hour
+        if h in uv_map
     ]
 
     if not forecast or max(uv for _, uv in forecast) < UV_MODERATE:
         return t(lang, "uv_clear_header") + "\n\n" + t(lang, "uv_clear_body")
 
     lines = [t(lang, "uv_header") + "\n", t(lang, "uv_apply")]
-    for hour, uv in forecast:
-        line = t(lang, "uv_hour_line", hour=hour, uv=uv, level=uv_level_label(uv, lang))
-        if uv >= UV_MODERATE:
-            line += " ⚠️"
-        lines.append(line)
+    lines += _uv_lines_and_peak(forecast, lang, mark_protection=True)
+    return "\n".join(lines)
 
-    peak_hour, peak_uv = max(forecast, key=lambda x: x[1])
-    lines.append(t(lang, "uv_peak", hour=peak_hour, uv=peak_uv))
-    lines.append(t(lang, "uv_tips"))
 
+def build_uv_day_message(hourly_uv: list[dict], lang: str) -> str:
+    """Full day forecast — used by the daily scheduled notification."""
+    uv_map = _uv_by_hour(hourly_uv)
+
+    protection_hours = [
+        (h, uv_map[h])
+        for h in sorted(uv_map)
+        if uv_map[h] >= UV_MODERATE
+    ]
+
+    if not protection_hours:
+        return t(lang, "uv_clear_header") + "\n\n" + t(lang, "uv_day_clear_body")
+
+    lines = [t(lang, "uv_day_header") + "\n", t(lang, "uv_day_apply")]
+    lines += _uv_lines_and_peak(protection_hours, lang, mark_protection=False)
     return "\n".join(lines)
 
 
@@ -510,7 +536,7 @@ async def send_daily_notifications(application: Application) -> None:
             hourly = await get_uv_forecast(data["lat"], data["lon"])
             await application.bot.send_message(
                 chat_id=int(user_id),
-                text=build_uv_message(hourly, lang),
+                text=build_uv_day_message(hourly, lang),
                 parse_mode="Markdown",
             )
             logger.info("Sent UV notification to user %s (%s)", user_id, lang)
