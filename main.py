@@ -1,9 +1,7 @@
-import json
 import logging
 import os
 import re
 from datetime import datetime
-from pathlib import Path
 
 import httpx
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -12,6 +10,7 @@ from telegram import Update, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboard
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 
 from constants import UV_VERY_HIGH, UV_HIGH, UV_EXTREME, UV_MODERATE, AVAILABLE_LANGUAGES, DEFAULT_NOTIFY_HOUR
+from db import get_user, upsert_user, update_notify_hour, update_lang, get_all_users, get_pool
 from translations import TRANSLATIONS
 
 load_dotenv()
@@ -22,7 +21,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-USERS_FILE = "users.json"
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 _uv_cache: dict[tuple[float, float], tuple[datetime, list[dict]]] = {}
@@ -54,17 +52,6 @@ def t(lang: str, key: str, **kwargs) -> str:
     text = TRANSLATIONS.get(lang, TRANSLATIONS["en"]).get(key) or TRANSLATIONS["en"][key]
     return text.format(**kwargs) if kwargs else text
 
-
-def load_users() -> dict:
-    if Path(USERS_FILE).exists():
-        with open(USERS_FILE) as f:
-            return json.load(f)
-    return {}
-
-
-def save_users(users: dict):
-    with open(USERS_FILE, "w") as f:
-        json.dump(users, f, indent=2, ensure_ascii=False)
 
 
 async def get_country_code(lat: float, lon: float) -> str | None:
@@ -214,8 +201,8 @@ def build_uv_day_message(hourly_uv: list[dict], lang: str) -> str:
     ])
 
 
-def user_lang(users: dict, user_id: str) -> str:
-    return users.get(user_id, {}).get("lang", "en")
+def user_lang(user: dict | None) -> str:
+    return (user or {}).get("lang", "en")
 
 
 def build_main_keyboard(lang: str) -> ReplyKeyboardMarkup:
@@ -285,24 +272,22 @@ async def send_welcome_prompt(update: Update, lang: str) -> None:
     )
 
 
-async def ensure_location(update: Update, users: dict, user_id: str) -> bool:
+async def ensure_location(update: Update, user: dict | None) -> bool:
     """Return True if user has a location. Otherwise send the welcome prompt and return False."""
-    if users.get(user_id, {}).get("lat"):
+    if user and user.get("lat"):
         return True
-    lang = user_lang(users, user_id)
-    await send_welcome_prompt(update, lang)
+    await send_welcome_prompt(update, user_lang(user))
     return False
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    users = load_users()
     assert update.effective_user is not None
-    lang = user_lang(users, str(update.effective_user.id))
-    await send_welcome_prompt(update, lang)
+    user = await get_user(update.effective_user.id)
+    await send_welcome_prompt(update, user_lang(user))
 
 
 async def _save_location(
-    user_id: str,
+    user_id: int,
     first_name: str,
     lat: float,
     lon: float,
@@ -315,20 +300,18 @@ async def _save_location(
     country_code = await get_country_code(lat, lon)
     detected_lang = COUNTRY_TO_LANG.get(country_code or "", "en")
 
-    users = load_users()
-    existing = users.get(user_id, {})
-    is_new = not existing.get("lat")
-    lang = existing.get("lang") or detected_lang
+    existing = await get_user(user_id)
+    is_new = existing is None or not existing.get("lat")
+    lang = (existing or {}).get("lang") or detected_lang
 
-    users[user_id] = {
-        **existing,
-        "name": first_name,
-        "lat": lat,
-        "lon": lon,
-        "notify_hour": existing.get("notify_hour", DEFAULT_NOTIFY_HOUR),
-        "lang": lang,
-    }
-    save_users(users)
+    await upsert_user(
+        user_id=user_id,
+        name=first_name,
+        lat=lat,
+        lon=lon,
+        notify_hour=(existing or {}).get("notify_hour", DEFAULT_NOTIFY_HOUR),
+        lang=lang,
+    )
     return lang, is_new, country_code
 
 
@@ -339,7 +322,7 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     loc = update.message.location
     lang, is_new, country_code = await _save_location(
-        str(user.id), user.first_name or "", loc.latitude, loc.longitude, context
+        user.id, user.first_name or "", loc.latitude, loc.longitude, context
     )
     key = "location_saved" if is_new else "location_updated"
     display = f"{loc.latitude:.4f}, {loc.longitude:.4f}"
@@ -355,17 +338,16 @@ async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def cmd_uv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_user is not None
     assert update.message is not None
-    user_id = str(update.effective_user.id)
-    users = load_users()
-    lang = user_lang(users, user_id)
+    user = await get_user(update.effective_user.id)
+    lang = user_lang(user)
 
-    if not await ensure_location(update, users, user_id):
+    if not await ensure_location(update, user):
         return
 
     await update.message.reply_text(t(lang, "fetching"))
     try:
-        data = users[user_id]
-        hourly = await get_uv_forecast(data["lat"], data["lon"])
+        assert user is not None
+        hourly = await get_uv_forecast(user["lat"], user["lon"])
         await update.message.reply_text(build_uv_message(hourly, lang), parse_mode="Markdown")
     except Exception as e:
         logger.error("UV fetch error: %s", e)
@@ -375,11 +357,10 @@ async def cmd_uv(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_user is not None
     assert update.message is not None
-    user_id = str(update.effective_user.id)
-    users = load_users()
-    lang = user_lang(users, user_id)
+    user = await get_user(update.effective_user.id)
+    lang = user_lang(user)
 
-    if not await ensure_location(update, users, user_id):
+    if not await ensure_location(update, user):
         return
 
     args = context.args
@@ -388,17 +369,15 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     hour = int(args[0])
-    users[user_id]["notify_hour"] = hour
-    save_users(users)
+    await update_notify_hour(update.effective_user.id, hour)
     await update.message.reply_text(t(lang, "time_set", hour=hour), parse_mode="Markdown")
 
 
 async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     assert update.effective_user is not None
     assert update.message is not None
-    user_id = str(update.effective_user.id)
-    users = load_users()
-    lang = user_lang(users, user_id)
+    user = await get_user(update.effective_user.id)
+    lang = user_lang(user)
 
     args = context.args
     if not args or args[0].lower() not in AVAILABLE_LANGUAGES:
@@ -406,11 +385,7 @@ async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     new_lang = args[0].lower()
-    if user_id in users:
-        users[user_id]["lang"] = new_lang
-    else:
-        users[user_id] = {"lang": new_lang, "notify_hour": DEFAULT_NOTIFY_HOUR}
-    save_users(users)
+    await update_lang(update.effective_user.id, new_lang)
     await update.message.reply_text(t(new_lang, "lang_set"))
 
 
@@ -433,11 +408,10 @@ async def handle_manual_location(
             await update.message.reply_text(t(lang, "location_not_found"))
             return
         lat, lon, display = result
-        # Trim long Nominatim display names to first two parts
         display = ", ".join(display.split(", ")[:2])
 
     user = update.effective_user
-    lang, _, _ = await _save_location(str(user.id), user.first_name or "", lat, lon, context)
+    lang, _, _ = await _save_location(user.id, user.first_name or "", lat, lon, context)
     await update.message.reply_text(
         t(lang, "location_updated", location=display),
         parse_mode="Markdown",
@@ -451,16 +425,12 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     assert update.effective_user is not None
     assert context.user_data is not None
     text = update.message.text
-    user_id = str(update.effective_user.id)
-    users = load_users()
-    lang = user_lang(users, user_id)
+    db_user = await get_user(update.effective_user.id)
+    lang = user_lang(db_user)
 
-    # If we're awaiting a manual location, handle text input unless a button was pressed
     if context.user_data.get("awaiting_location"):
-        # Always allow input in this state regardless of whether location exists
         pass
-    elif not users.get(user_id, {}).get("lat") and detect_button_action(text) != "location":
-        # No location yet and not asking to change it — show welcome prompt
+    elif not (db_user and db_user.get("lat")) and detect_button_action(text) != "location":
         await send_welcome_prompt(update, lang)
         return
 
@@ -468,7 +438,6 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         if detect_button_action(text) is None:
             await handle_manual_location(update, context, text, lang)
             return
-        # A different button was tapped — cancel the awaiting state and fall through
         context.user_data.pop("awaiting_location", None)
 
     action = detect_button_action(text)
@@ -494,25 +463,19 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.answer()
 
     assert query.data is not None
-    user_id = str(update.effective_user.id)
-    users = load_users()
-    lang = user_lang(users, user_id)
+    user_id = update.effective_user.id
+    db_user = await get_user(user_id)
+    lang = user_lang(db_user)
     data = query.data
 
     if data.startswith("settime:"):
         hour = int(data.split(":")[1])
-        if user_id in users:
-            users[user_id]["notify_hour"] = hour
-            save_users(users)
+        await update_notify_hour(user_id, hour)
         await query.edit_message_text(t(lang, "time_set", hour=hour), parse_mode="Markdown")
 
     elif data.startswith("lang:"):
         new_lang = data.split(":")[1]
-        if user_id in users:
-            users[user_id]["lang"] = new_lang
-        else:
-            users[user_id] = {"lang": new_lang, "notify_hour": DEFAULT_NOTIFY_HOUR}
-        save_users(users)
+        await update_lang(user_id, new_lang)
         await query.edit_message_text(t(new_lang, "lang_set"))
         await context.bot.send_message(
             chat_id=update.effective_chat.id,
@@ -525,28 +488,32 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def send_daily_notifications(application: Application) -> None:
     current_hour = datetime.now().hour
-    users = load_users()
+    all_users = await get_all_users()
 
-    for user_id, data in users.items():
-        if data.get("notify_hour", DEFAULT_NOTIFY_HOUR) != current_hour:
+    for user in all_users:
+        if user.get("notify_hour", DEFAULT_NOTIFY_HOUR) != current_hour:
             continue
-        lang = data.get("lang", "en")
+        lang = user.get("lang", "en")
         try:
-            hourly = await get_uv_forecast(data["lat"], data["lon"])
+            hourly = await get_uv_forecast(user["lat"], user["lon"])
             await application.bot.send_message(
-                chat_id=int(user_id),
+                chat_id=user["user_id"],
                 text=build_uv_day_message(hourly, lang),
                 parse_mode="Markdown",
             )
-            logger.info("Sent UV notification to user %s (%s)", user_id, lang)
+            logger.info("Sent UV notification to user %s (%s)", user["user_id"], lang)
         except Exception as e:
-            logger.error("Failed to notify user %s: %s", user_id, e)
+            logger.error("Failed to notify user %s: %s", user["user_id"], e)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+async def post_init(application: Application) -> None:
+    await get_pool()  # initialise DB connection pool on startup
+
+
 def main() -> None:
-    application = Application.builder().token(BOT_TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("uv", cmd_uv))
